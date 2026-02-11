@@ -1,0 +1,25 @@
+name: Download Lichess Games
+
+on:
+  push:
+    branches:
+      - claude/lichess-download-games-stwum
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download last 20 games of agrebneva
+        run: python download_lichess_games.py agrebneva 20 agrebneva_last20.pgn
+
+      - name: Commit PGN file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add agrebneva_last20.pgn
+          git diff --cached --quiet || git commit -m "Add last 20 games of agrebneva from Lichess"
+          git push
