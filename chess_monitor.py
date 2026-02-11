@@ -14,15 +14,19 @@ Environment variables:
     STOCKFISH_PATH      - Path to Stockfish binary (default: "stockfish")
 """
 
+import io
 import os
+import re
 import sys
 import json
 import time
 import logging
 
+import cairosvg
 import requests
 import chess
 import chess.engine
+import chess.svg
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,12 +41,13 @@ LICHESS_CURRENT_GAME = LICHESS_BASE + "/api/user/{username}/current-game"
 LICHESS_STREAM_GAME = LICHESS_BASE + "/api/stream/game/{game_id}"
 
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_PHOTO_URL = "https://api.telegram.org/bot{token}/sendPhoto"
 
-STOCKFISH_DEPTH = 20
+STOCKFISH_DEPTH = 12
 STOCKFISH_MULTIPV = 3
 
 POLL_INTERVAL = 10  # seconds between checks when no game is active
-GAME_POLL_INTERVAL = 2  # seconds between move checks during a game
+GAME_POLL_INTERVAL = 0.5  # seconds between move checks during a game
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +82,31 @@ def send_telegram_message(text):
     return False
 
 
+def send_telegram_photo(image_bytes, caption=""):
+    """Send a PNG image with an HTML-formatted caption to Telegram.
+
+    *image_bytes* is the raw PNG content as a bytes object.
+    Returns True on success, False on failure. Never raises.
+    """
+    url = TELEGRAM_PHOTO_URL.format(token=TELEGRAM_BOT_TOKEN)
+    files = {
+        "photo": ("board.png", io.BytesIO(image_bytes), "image/png"),
+    }
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    try:
+        resp = requests.post(url, data=data, files=files, timeout=15)
+        if resp.status_code == 200:
+            return True
+        logger.error("Telegram photo send failed (%s): %s", resp.status_code, resp.text)
+    except requests.RequestException as exc:
+        logger.error("Telegram photo send error: %s", exc)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Score formatting
 # ---------------------------------------------------------------------------
@@ -104,8 +134,121 @@ def format_score(pov_score, from_white=True):
 
 
 def format_board_text(board):
-    """Return a text board diagram wrapped in <pre> tags for Telegram."""
+    """Return a text board diagram wrapped in <pre> tags for Telegram (fallback)."""
     return "<pre>\n" + str(board.unicode(borders=True)) + "\n</pre>"
+
+
+def generate_board_image(board, player_color, analysis, last_move=None):
+    """Generate a PNG image of the board with arrows for the best moves.
+
+    Returns PNG image as bytes, or None on failure.
+    """
+    arrow_colors = ["green", "#cccc00cc", "#0088ccaa"]
+    arrows = []
+
+    if analysis["side_to_move"] == player_color:
+        # Player's turn: show their top 3 candidate moves
+        for i, line in enumerate(analysis["current_lines"][:3]):
+            try:
+                move = board.parse_san(line["move_san"])
+                color = arrow_colors[i]
+                arrows.append(chess.svg.Arrow(move.from_square, move.to_square, color=color))
+            except (ValueError, KeyError):
+                pass
+    else:
+        # Opponent's turn: show expected opponent move as red arrow
+        if analysis["current_lines"]:
+            try:
+                opp_move = board.parse_san(analysis["current_lines"][0]["move_san"])
+                arrows.append(chess.svg.Arrow(opp_move.from_square, opp_move.to_square, color="red"))
+            except (ValueError, KeyError):
+                pass
+
+    try:
+        svg_data = chess.svg.board(
+            board,
+            orientation=player_color,
+            lastmove=last_move,
+            arrows=arrows,
+            size=400,
+            coordinates=True,
+        )
+        png_bytes = cairosvg.svg2png(
+            bytestring=svg_data.encode("utf-8"),
+            output_width=800,
+        )
+        return png_bytes
+    except Exception as exc:
+        logger.error("Board image generation failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Plain English move descriptions
+# ---------------------------------------------------------------------------
+
+_PIECE_NAMES = {
+    "N": "Knight",
+    "B": "Bishop",
+    "R": "Rook",
+    "Q": "Queen",
+    "K": "King",
+}
+
+
+def san_to_english(san):
+    """Convert a SAN move string to a plain-English description.
+
+    Examples:
+        "Nf3"     -> "Knight to f3"
+        "Bxe5"    -> "Bishop captures on e5"
+        "exd5"    -> "e-pawn captures on d5"
+        "e4"      -> "Pawn to e4"
+        "O-O"     -> "Castle kingside"
+        "O-O-O"   -> "Castle queenside"
+        "e8=Q+"   -> "Pawn to e8 promoting to Queen, check"
+    """
+    stripped = san.rstrip("+#")
+    suffix = ""
+    if san.endswith("#"):
+        suffix = ", checkmate"
+    elif san.endswith("+"):
+        suffix = ", check"
+
+    if stripped in ("O-O", "0-0"):
+        return "Castle kingside" + suffix
+    if stripped in ("O-O-O", "0-0-0"):
+        return "Castle queenside" + suffix
+
+    m = re.match(
+        r"^([NBRQK])?([a-h]?[1-8]?)(x)?([a-h][1-8])(?:=([NBRQK]))?[+#]?$",
+        san,
+    )
+    if not m:
+        return san
+
+    piece_letter, disambig, capture, dest, promotion = m.groups()
+
+    if piece_letter:
+        piece_name = _PIECE_NAMES[piece_letter]
+    else:
+        if capture:
+            piece_name = f"{disambig}-pawn" if disambig else "Pawn"
+        else:
+            piece_name = "Pawn"
+
+    if capture:
+        action = f"captures on {dest}"
+    else:
+        action = f"to {dest}"
+
+    parts = [piece_name, action]
+
+    if promotion:
+        promo_name = _PIECE_NAMES.get(promotion, promotion)
+        parts.append(f"promoting to {promo_name}")
+
+    return " ".join(parts) + suffix
 
 
 # ---------------------------------------------------------------------------
@@ -351,8 +494,9 @@ def format_game_start_message(game_data, username, player_color):
     return "\n".join(lines)
 
 
-def format_move_message(
+def format_move_update(
     move_san,
+    move_obj,
     half_move_index,
     board,
     player_color,
@@ -360,8 +504,10 @@ def format_move_message(
     opponent_name,
     analysis,
 ):
-    """Build the Telegram message for a single move."""
-    # Determine who made this move — the color that just moved is not board.turn
+    """Build the Telegram caption and board image for a single move.
+
+    Returns (caption_text, image_bytes_or_none).
+    """
     moved_color = not board.turn
     full_move_number = (half_move_index // 2) + 1
     dot = "." if moved_color == chess.WHITE else "..."
@@ -376,41 +522,40 @@ def format_move_message(
     lines = [
         f"<b>Move {full_move_number}{dot} {move_san}</b> by {mover_name} ({color_word})",
         f"<b>Eval:</b> {analysis['eval_score']}",
-        "",
     ]
 
-    # Top 3 for the monitored player
+    # Show opponent's last move prominently
+    if moved_color != player_color:
+        english = san_to_english(move_san)
+        lines.append("")
+        lines.append(f"<b>Opponent played:</b> {move_san} ({english})")
+
+    # Top 3 for the monitored player only
     if analysis["side_to_move"] == player_color:
         player_lines = analysis["current_lines"]
-        opp_lines = analysis["response_lines"]
     else:
         player_lines = analysis["response_lines"]
-        opp_lines = analysis["current_lines"]
 
     player_color_word = "White" if player_color == chess.WHITE else "Black"
-    opp_color_word = "White" if player_color == chess.BLACK else "Black"
 
-    lines.append(f"<b>Top 3 for {username} ({player_color_word}):</b>")
+    lines.append("")
+    lines.append(f"<b>Best moves for {username} ({player_color_word}):</b>")
     if player_lines:
-        for i, line in enumerate(player_lines[:3], 1):
-            pv_str = " ".join(line["pv_san"][:4])
-            lines.append(f"  {i}. {line['move_san']}  ({line['score']})  {pv_str}")
+        for i, line_info in enumerate(player_lines[:3], 1):
+            english = san_to_english(line_info["move_san"])
+            lines.append(
+                f"  {i}. {line_info['move_san']} - {english}"
+                f"  ({line_info['score']})"
+            )
     else:
         lines.append("  (no lines available)")
 
-    lines.append("")
-    lines.append(f"<b>Top 3 for {opponent_name} ({opp_color_word}):</b>")
-    if opp_lines:
-        for i, line in enumerate(opp_lines[:3], 1):
-            pv_str = " ".join(line["pv_san"][:4])
-            lines.append(f"  {i}. {line['move_san']}  ({line['score']})  {pv_str}")
-    else:
-        lines.append("  (no lines available)")
+    caption = "\n".join(lines)
 
-    lines.append("")
-    lines.append(format_board_text(board))
+    # Generate board image
+    image_bytes = generate_board_image(board, player_color, analysis, last_move=move_obj)
 
-    return "\n".join(lines)
+    return caption, image_bytes
 
 
 def format_game_end_message(game_data):
@@ -476,8 +621,9 @@ def process_new_move(
             "response_lines": [],
         }
 
-    msg = format_move_message(
+    caption, image_bytes = format_move_update(
         move_san,
+        move,
         half_move_index,
         board,
         player_color,
@@ -485,7 +631,12 @@ def process_new_move(
         opponent_name,
         analysis,
     )
-    send_telegram_message(msg)
+
+    if image_bytes:
+        if not send_telegram_photo(image_bytes, caption=caption):
+            send_telegram_message(caption + "\n\n" + format_board_text(board))
+    else:
+        send_telegram_message(caption + "\n\n" + format_board_text(board))
 
     moved_color = "White" if (not board.turn) == chess.WHITE else "Black"
     logger.info(
