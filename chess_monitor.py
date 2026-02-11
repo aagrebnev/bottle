@@ -685,7 +685,7 @@ def monitor_game(game_id, game_data, username, engine_mgr):
     # --- Try streaming API first ---
     url = LICHESS_STREAM_GAME.format(game_id=game_id)
     headers = {"Accept": "application/x-ndjson"}
-    max_reconnects = 5
+    max_reconnects = 1
 
     for attempt in range(max_reconnects):
         try:
@@ -703,10 +703,10 @@ def monitor_game(game_id, game_data, username, engine_mgr):
                 continue
             if resp.status_code != 200:
                 logger.warning(
-                    "Stream returned %s — retrying", resp.status_code,
+                    "Stream returned %s — falling back to polling",
+                    resp.status_code,
                 )
-                time.sleep(2 * (attempt + 1))
-                continue
+                break
 
             for line in resp.iter_lines():
                 if not line:
@@ -717,6 +717,7 @@ def monitor_game(game_id, game_data, username, engine_mgr):
                     continue
 
                 etype = event.get("type")
+                logger.info("Stream event: type=%s", etype)
 
                 if etype == "gameFull":
                     game_data = event
@@ -766,6 +767,15 @@ def monitor_game(game_id, game_data, username, engine_mgr):
                     if status not in ("started", "created"):
                         _handle_game_end(game_data)
                         return
+
+                else:
+                    # Unrecognized event — stream format may differ
+                    logger.warning(
+                        "Unrecognized stream event type=%s keys=%s "
+                        "— falling back to polling",
+                        etype, list(event.keys()),
+                    )
+                    break  # exit iter_lines, then break to polling
 
             # Stream exhausted — game is over
             logger.info("Stream for game %s closed", game_id)
