@@ -43,11 +43,11 @@ LICHESS_STREAM_GAME = LICHESS_BASE + "/api/stream/game/{game_id}"
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO_URL = "https://api.telegram.org/bot{token}/sendPhoto"
 
-STOCKFISH_DEPTH = 12
-STOCKFISH_MULTIPV = 3
+STOCKFISH_DEPTH = 8
+STOCKFISH_MULTIPV = 2
 
 POLL_INTERVAL = 10  # seconds between checks when no game is active
-GAME_POLL_INTERVAL = 0.5  # seconds between move checks during a game
+GAME_POLL_INTERVAL = 0.1  # seconds between move checks during a game
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,24 +143,16 @@ def generate_board_image(board, player_color, analysis, last_move=None):
 
     Returns PNG image as bytes, or None on failure.
     """
-    arrow_colors = ["green", "#cccc00cc", "#0088ccaa"]
+    arrow_colors = ["green", "#cccc00cc"]
     arrows = []
 
     if analysis["side_to_move"] == player_color:
-        # Player's turn: show their top 3 candidate moves
-        for i, line in enumerate(analysis["current_lines"][:3]):
+        # Player's turn: show their top 2 candidate moves
+        for i, line in enumerate(analysis["current_lines"][:2]):
             try:
                 move = board.parse_san(line["move_san"])
                 color = arrow_colors[i]
                 arrows.append(chess.svg.Arrow(move.from_square, move.to_square, color=color))
-            except (ValueError, KeyError):
-                pass
-    else:
-        # Opponent's turn: show expected opponent move as red arrow
-        if analysis["current_lines"]:
-            try:
-                opp_move = board.parse_san(analysis["current_lines"][0]["move_san"])
-                arrows.append(chess.svg.Arrow(opp_move.from_square, opp_move.to_square, color="red"))
             except (ValueError, KeyError):
                 pass
 
@@ -295,8 +287,8 @@ def analyze_position(engine_mgr, board):
     Returns a dict with:
       eval_score       — evaluation string from White's perspective
       side_to_move     — chess.WHITE or chess.BLACK
-      current_lines    — top 3 lines for the side to move
-      response_lines   — top 3 lines for the other side (after best move)
+      current_lines    — top 2 lines for the side to move
+      response_lines   — always [] (kept for interface compatibility)
 
     Each line is a dict: {"move_san": str, "score": str, "pv_san": [str]}
     """
@@ -327,35 +319,6 @@ def analyze_position(engine_mgr, board):
             "pv_san": pv_san,
         })
 
-    # Top 3 response lines for the other side
-    response_lines = []
-    if current_lines:
-        best_move = board.parse_san(current_lines[0]["move_san"])
-        reply_board = board.copy()
-        reply_board.push(best_move)
-        if not reply_board.is_game_over():
-            reply_results = engine_mgr.analyse(
-                reply_board, limit, multipv=STOCKFISH_MULTIPV
-            )
-            if not isinstance(reply_results, list):
-                reply_results = [reply_results]
-            for info in reply_results:
-                pv = info.get("pv", [])
-                if not pv:
-                    continue
-                move_san = reply_board.san(pv[0])
-                tmp = reply_board.copy()
-                pv_san = []
-                for m in pv[:5]:
-                    pv_san.append(tmp.san(m))
-                    tmp.push(m)
-                score_str = format_score(info["score"], from_white=True)
-                response_lines.append({
-                    "move_san": move_san,
-                    "score": score_str,
-                    "pv_san": pv_san,
-                })
-
     # Overall eval from White's perspective
     if results:
         eval_score = format_score(results[0]["score"], from_white=True)
@@ -366,7 +329,7 @@ def analyze_position(engine_mgr, board):
         "eval_score": eval_score,
         "side_to_move": side_to_move,
         "current_lines": current_lines,
-        "response_lines": response_lines,
+        "response_lines": [],
     }
 
 
@@ -530,25 +493,22 @@ def format_move_update(
         lines.append("")
         lines.append(f"<b>Opponent played:</b> {move_san} ({english})")
 
-    # Top 3 for the monitored player only
+    # Show best moves only when it's the player's turn
     if analysis["side_to_move"] == player_color:
         player_lines = analysis["current_lines"]
-    else:
-        player_lines = analysis["response_lines"]
+        player_color_word = "White" if player_color == chess.WHITE else "Black"
 
-    player_color_word = "White" if player_color == chess.WHITE else "Black"
-
-    lines.append("")
-    lines.append(f"<b>Best moves for {username} ({player_color_word}):</b>")
-    if player_lines:
-        for i, line_info in enumerate(player_lines[:3], 1):
-            english = san_to_english(line_info["move_san"])
-            lines.append(
-                f"  {i}. {line_info['move_san']} - {english}"
-                f"  ({line_info['score']})"
-            )
-    else:
-        lines.append("  (no lines available)")
+        lines.append("")
+        lines.append(f"<b>Best moves for {username} ({player_color_word}):</b>")
+        if player_lines:
+            for i, line_info in enumerate(player_lines[:2], 1):
+                english = san_to_english(line_info["move_san"])
+                lines.append(
+                    f"  {i}. {line_info['move_san']} - {english}"
+                    f"  ({line_info['score']})"
+                )
+        else:
+            lines.append("  (no lines available)")
 
     caption = "\n".join(lines)
 
