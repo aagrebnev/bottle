@@ -18,10 +18,8 @@ import io
 import os
 import re
 import sys
-import json
 import time
 import logging
-import threading
 
 import cairosvg
 import requests
@@ -39,7 +37,6 @@ STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "stockfish")
 
 LICHESS_BASE = "https://lichess.org"
 LICHESS_CURRENT_GAME = LICHESS_BASE + "/api/user/{username}/current-game"
-LICHESS_STREAM_GAME = LICHESS_BASE + "/api/stream/game/{game_id}"
 
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO_URL = "https://api.telegram.org/bot{token}/sendPhoto"
@@ -48,7 +45,7 @@ STOCKFISH_DEPTH = 8
 STOCKFISH_MULTIPV = 2
 
 POLL_INTERVAL = 10  # seconds between checks when no game is active
-GAME_POLL_INTERVAL = 0.1  # seconds between move checks during a game
+GAME_POLL_INTERVAL = 2  # seconds between move checks during a game
 
 logging.basicConfig(
     level=logging.INFO,
@@ -562,32 +559,22 @@ def _send_move_notification(
     username,
     opponent_name,
     engine_mgr,
-    skip_analysis=False,
 ):
     """Analyse a position and send the move notification to Telegram.
 
-    Runs in a background thread.  *board* must be a copy with the move
-    already pushed.  When *skip_analysis* is True the Stockfish call is
-    skipped (used when moves arrive faster than they can be analysed).
+    Called synchronously.  *board* must be a copy with the move already
+    pushed.  Always runs Stockfish analysis.
     """
-    if skip_analysis:
+    try:
+        analysis = analyze_position(engine_mgr, board)
+    except Exception as exc:
+        logger.error("Stockfish analysis failed: %s", exc)
         analysis = {
-            "eval_score": "...",
+            "eval_score": "?",
             "side_to_move": board.turn,
             "current_lines": [],
             "response_lines": [],
         }
-    else:
-        try:
-            analysis = analyze_position(engine_mgr, board)
-        except Exception as exc:
-            logger.error("Stockfish analysis failed: %s", exc)
-            analysis = {
-                "eval_score": "?",
-                "side_to_move": board.turn,
-                "current_lines": [],
-                "response_lines": [],
-            }
 
     caption, image_bytes = format_move_update(
         move_san,
@@ -622,9 +609,12 @@ def _send_move_notification(
 
 
 def monitor_game(game_id, game_data, username, engine_mgr):
-    """Monitor a single game using the Lichess streaming API.
+    """Monitor a single game by polling the Lichess REST API.
 
-    Falls back to polling if the stream is unavailable.
+    Notifications are processed synchronously to guarantee correct ordering
+    in Telegram.  When catching up on multiple moves at once, only the
+    latest position is analysed and sent — intermediate moves are replayed
+    silently on the internal board.
     """
     player_color = determine_player_color(game_data, username)
     white_name, black_name = get_player_names(game_data)
@@ -636,184 +626,37 @@ def monitor_game(game_id, game_data, username, engine_mgr):
 
     board = chess.Board()
     known_move_count = 0
-    notify_thread = None
 
-    def _dispatch_new_uci_moves(uci_moves):
-        """Push new UCI moves onto the board and launch notification threads."""
-        nonlocal known_move_count, notify_thread
-        while known_move_count < len(uci_moves):
-            uci_str = uci_moves[known_move_count]
-            try:
-                move = board.parse_uci(uci_str)
-            except ValueError:
-                logger.error(
-                    "Invalid UCI move '%s' at index %d",
-                    uci_str, known_move_count,
-                )
-                known_move_count += 1
-                continue
-
-            san = board.san(move)
-            board.push(move)
-            idx = known_move_count
-            known_move_count += 1
-
-            # If the previous notification is still running (analysis/upload),
-            # skip Stockfish for this move to avoid falling further behind.
-            skip = notify_thread is not None and notify_thread.is_alive()
-            board_copy = board.copy()
-            notify_thread = threading.Thread(
-                target=_send_move_notification,
-                args=(
-                    board_copy, san, move, idx, player_color,
-                    username, opponent_name, engine_mgr, skip,
-                ),
-                daemon=True,
-            )
-            notify_thread.start()
-
-    def _handle_game_end(end_data):
-        """Wait for the last notification and send the game-end message."""
-        if notify_thread is not None:
-            notify_thread.join(timeout=30)
-        send_telegram_message(format_game_end_message(end_data))
-        logger.info(
-            "Game %s ended with status: %s",
-            game_id, end_data.get("status", "?"),
-        )
-
-    # --- Try streaming API first ---
-    url = LICHESS_STREAM_GAME.format(game_id=game_id)
-    headers = {"Accept": "application/x-ndjson"}
-    max_reconnects = 1
-
-    for attempt in range(max_reconnects):
+    # Replay any moves already present in the initial game_data
+    moves_str = game_data.get("moves", "")
+    san_moves = moves_str.split() if moves_str.strip() else []
+    for san in san_moves:
         try:
-            resp = requests.get(
-                url, headers=headers, stream=True, timeout=(10, 300),
-            )
-            if resp.status_code == 404:
-                logger.warning(
-                    "Stream 404 for game %s — falling back to polling", game_id,
-                )
-                break  # jump to polling fallback
-            if resp.status_code == 429:
-                logger.warning("Stream rate-limited — waiting 60 s")
-                time.sleep(60)
-                continue
-            if resp.status_code != 200:
-                logger.warning(
-                    "Stream returned %s — falling back to polling",
-                    resp.status_code,
-                )
-                break
-
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = event.get("type")
-                logger.info("Stream event: type=%s", etype)
-
-                if etype == "gameFull":
-                    game_data = event
-                    state = event.get("state", {})
-                    moves_str = state.get("moves", "")
-                    status = state.get("status", "started")
-
-                    # Replay existing moves silently (no notifications)
-                    uci_moves = (
-                        moves_str.split() if moves_str.strip() else []
-                    )
-                    while known_move_count < len(uci_moves):
-                        uci_str = uci_moves[known_move_count]
-                        try:
-                            m = board.parse_uci(uci_str)
-                            board.push(m)
-                            known_move_count += 1
-                        except ValueError:
-                            logger.error(
-                                "Failed to replay UCI move: '%s'", uci_str,
-                            )
-                            return
-
-                    logger.info(
-                        "Game %s: replayed %d existing moves via stream",
-                        game_id, known_move_count,
-                    )
-
-                    if status not in ("started", "created"):
-                        _handle_game_end(game_data)
-                        return
-
-                elif etype == "gameState":
-                    moves_str = event.get("moves", "")
-                    status = event.get("status", "started")
-
-                    if "winner" in event:
-                        game_data["winner"] = event["winner"]
-                    game_data["status"] = status
-                    game_data["moves"] = moves_str
-
-                    uci_moves = (
-                        moves_str.split() if moves_str.strip() else []
-                    )
-                    _dispatch_new_uci_moves(uci_moves)
-
-                    if status not in ("started", "created"):
-                        _handle_game_end(game_data)
-                        return
-
-                else:
-                    # Unrecognized event — stream format may differ
-                    logger.warning(
-                        "Unrecognized stream event type=%s keys=%s "
-                        "— falling back to polling",
-                        etype, list(event.keys()),
-                    )
-                    break  # exit iter_lines, then break to polling
-
-            # Stream exhausted — game is over
-            logger.info("Stream for game %s closed", game_id)
+            move = board.parse_san(san)
+            board.push(move)
+            known_move_count += 1
+        except ValueError:
+            logger.error("Failed to replay move: '%s'", san)
             return
 
-        except requests.RequestException as exc:
-            logger.warning(
-                "Stream error: %s — reconnecting in %d s",
-                exc, 2 * (attempt + 1),
-            )
-            time.sleep(2 * (attempt + 1))
+    if known_move_count > 0:
+        logger.info(
+            "Game %s: replayed %d existing moves", game_id, known_move_count,
+        )
 
-    # --- Fallback: polling ---
-    logger.info("Using polling fallback for game %s", game_id)
-
-    # If we haven't replayed moves yet (stream never worked), do it now
-    if known_move_count == 0:
-        moves_str = game_data.get("moves", "")
-        san_moves = moves_str.split() if moves_str.strip() else []
-        for san in san_moves:
-            try:
-                move = board.parse_san(san)
-                board.push(move)
-                known_move_count += 1
-            except ValueError:
-                logger.error("Failed to replay move: '%s'", san)
-                return
-
+    # --- Polling loop ---
     while True:
         time.sleep(GAME_POLL_INTERVAL)
 
         fresh = get_current_game(username)
         if fresh is None:
-            _handle_game_end(game_data)
+            send_telegram_message(format_game_end_message(game_data))
+            logger.info("Game %s ended (no active game)", game_id)
             return
 
         if fresh.get("id") != game_id:
-            _handle_game_end(game_data)
+            send_telegram_message(format_game_end_message(game_data))
+            logger.info("Game %s ended (different game active)", game_id)
             return
 
         game_data = fresh
@@ -822,36 +665,66 @@ def monitor_game(game_id, game_data, username, engine_mgr):
             fresh_moves_str.split() if fresh_moves_str.strip() else []
         )
 
-        while known_move_count < len(current_moves):
-            san = current_moves[known_move_count]
+        new_move_count = len(current_moves) - known_move_count
+        if new_move_count <= 0:
+            # No new moves — check for game-over
+            status = fresh.get("status", "")
+            if status not in ("started", "created"):
+                send_telegram_message(format_game_end_message(fresh))
+                logger.info(
+                    "Game %s ended with status: %s", game_id, status,
+                )
+                return
+            continue
+
+        # --- Process new moves ---
+        # Replay ALL new moves on the board first (fast, no analysis)
+        last_san = None
+        last_move_obj = None
+        for i in range(known_move_count, len(current_moves)):
+            san = current_moves[i]
             try:
                 move = board.parse_san(san)
             except ValueError:
-                logger.error(
-                    "Invalid move '%s' at index %d", san, known_move_count,
-                )
-                known_move_count += 1
+                logger.error("Invalid move '%s' at index %d", san, i)
+                known_move_count = i + 1
                 continue
-
             board.push(move)
-            idx = known_move_count
-            known_move_count += 1
+            last_san = san
+            last_move_obj = move
 
-            skip = notify_thread is not None and notify_thread.is_alive()
-            board_copy = board.copy()
-            notify_thread = threading.Thread(
-                target=_send_move_notification,
-                args=(
-                    board_copy, san, move, idx, player_color,
-                    username, opponent_name, engine_mgr, skip,
-                ),
-                daemon=True,
+        last_half_move_index = len(current_moves) - 1
+
+        if new_move_count > 1:
+            logger.info(
+                "Caught up %d moves (moves %d-%d), notifying for latest only",
+                new_move_count,
+                known_move_count + 1,
+                len(current_moves),
             )
-            notify_thread.start()
 
+        known_move_count = len(current_moves)
+
+        # Send ONE notification for the latest position (synchronous)
+        if last_san is not None:
+            _send_move_notification(
+                board.copy(),
+                last_san,
+                last_move_obj,
+                last_half_move_index,
+                player_color,
+                username,
+                opponent_name,
+                engine_mgr,
+            )
+
+        # Check game status after processing moves
         status = fresh.get("status", "")
         if status not in ("started", "created"):
-            _handle_game_end(fresh)
+            send_telegram_message(format_game_end_message(fresh))
+            logger.info(
+                "Game %s ended with status: %s", game_id, status,
+            )
             return
 
 
