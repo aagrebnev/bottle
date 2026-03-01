@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DC Yield Quoter</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+        .container { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
+        h1 {
+            text-align: center;
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { text-align: center; color: #94a3b8; margin-bottom: 2rem; }
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            border: 1px solid #334155;
+        }
+        .card h2 { font-size: 1.1rem; color: #38bdf8; margin-bottom: 1rem; }
+        .form-row {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+        .form-group {
+            flex: 1;
+            min-width: 140px;
+        }
+        label {
+            display: block;
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-bottom: 0.3rem;
+        }
+        input {
+            width: 100%;
+            padding: 0.5rem 0.75rem;
+            background: #0f172a;
+            border: 1px solid #475569;
+            border-radius: 6px;
+            color: #e2e8f0;
+            font-size: 0.95rem;
+        }
+        input:focus { outline: none; border-color: #38bdf8; }
+        button {
+            padding: 0.6rem 1.5rem;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        button:hover { opacity: 0.9; }
+        .results {
+            margin-top: 1rem;
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 0.85rem;
+            white-space: pre-wrap;
+            display: none;
+            border: 1px solid #334155;
+        }
+        .results.visible { display: block; }
+        .results .label { color: #94a3b8; }
+        .results .value { color: #34d399; font-weight: 600; }
+        .api-docs {
+            margin-top: 2rem;
+            font-size: 0.85rem;
+            color: #64748b;
+        }
+        .api-docs code {
+            background: #1e293b;
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            color: #94a3b8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>DC Yield Quoter</h1>
+        <p class="subtitle">Financial yield calculations &mdash; simple, compound, discount, and more</p>
+
+        <div class="card">
+            <h2>Full Yield Quote</h2>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Principal ($)</label>
+                    <input type="number" id="q-principal" value="10000" step="100">
+                </div>
+                <div class="form-group">
+                    <label>Annual Rate (decimal)</label>
+                    <input type="number" id="q-rate" value="0.05" step="0.001">
+                </div>
+                <div class="form-group">
+                    <label>Years</label>
+                    <input type="number" id="q-years" value="3" step="0.5">
+                </div>
+                <div class="form-group">
+                    <label>Comp. Periods/yr</label>
+                    <input type="number" id="q-periods" value="12" step="1">
+                </div>
+            </div>
+            <button onclick="getQuote()">Get Quote</button>
+            <div class="results" id="quote-results"></div>
+        </div>
+
+        <div class="card">
+            <h2>Discount Yield (T-Bills)</h2>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Face Value ($)</label>
+                    <input type="number" id="d-face" value="10000" step="100">
+                </div>
+                <div class="form-group">
+                    <label>Purchase Price ($)</label>
+                    <input type="number" id="d-price" value="9800" step="10">
+                </div>
+                <div class="form-group">
+                    <label>Days to Maturity</label>
+                    <input type="number" id="d-days" value="90" step="1">
+                </div>
+            </div>
+            <button onclick="getDiscount()">Calculate</button>
+            <div class="results" id="discount-results"></div>
+        </div>
+
+        <div class="card">
+            <h2>Current Bond Yield</h2>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Annual Coupon ($)</label>
+                    <input type="number" id="b-coupon" value="50" step="1">
+                </div>
+                <div class="form-group">
+                    <label>Market Price ($)</label>
+                    <input type="number" id="b-price" value="980" step="1">
+                </div>
+            </div>
+            <button onclick="getBondYield()">Calculate</button>
+            <div class="results" id="bond-results"></div>
+        </div>
+
+        <div class="api-docs">
+            <h2 style="color:#64748b;margin-bottom:0.5rem;">API Endpoints</h2>
+            <p><code>GET /api/simple-yield?principal=&rate=&years=</code></p>
+            <p><code>GET /api/compound-yield?principal=&rate=&years=&periods=</code></p>
+            <p><code>GET /api/apr-to-apy?apr=&periods=</code></p>
+            <p><code>GET /api/apy-to-apr?apy=&periods=</code></p>
+            <p><code>GET /api/discount-yield?face_value=&purchase_price=&days=</code></p>
+            <p><code>GET /api/bond-equivalent-yield?face_value=&purchase_price=&days=</code></p>
+            <p><code>GET /api/current-yield?coupon=&price=</code></p>
+            <p><code>GET /api/continuous-yield?principal=&rate=&years=</code></p>
+            <p><code>POST /api/quote</code> (JSON body with principal, rate, years, compounding_periods)</p>
+        </div>
+    </div>
+
+    <script>
+        async function getQuote() {
+            const body = {
+                principal: parseFloat(document.getElementById('q-principal').value),
+                rate: parseFloat(document.getElementById('q-rate').value),
+                years: parseFloat(document.getElementById('q-years').value),
+                compounding_periods: parseInt(document.getElementById('q-periods').value),
+            };
+            const res = await fetch('/api/quote', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            const el = document.getElementById('quote-results');
+            el.classList.add('visible');
+            if (data.error) { el.innerHTML = '<span class="value">' + data.error + '</span>'; return; }
+            el.innerHTML = formatQuote(data, body);
+        }
+
+        function formatQuote(data, input) {
+            const p = input.principal.toLocaleString();
+            const r = (input.rate * 100).toFixed(2);
+            let out = `<span class="label">Investment:</span> <span class="value">$${p}</span> at <span class="value">${r}%</span> for <span class="value">${input.years} years</span>\n\n`;
+            out += `<span class="label">Simple Yield:</span>       <span class="value">$${data.simple.future_value.toLocaleString()}</span>  (interest: $${data.simple.interest_earned.toLocaleString()})\n`;
+            out += `<span class="label">Compound Yield:</span>     <span class="value">$${data.compound.future_value.toLocaleString()}</span>  (APY: ${data.compound.apy_pct}%)\n`;
+            out += `<span class="label">Continuous Yield:</span>   <span class="value">$${data.continuous.future_value.toLocaleString()}</span>  (EAR: ${data.continuous.effective_annual_rate_pct}%)\n`;
+            out += `\n<span class="label">APR ${r}% → APY:</span>    <span class="value">${data.apr_to_apy.apy_pct}%</span>`;
+            return out;
+        }
+
+        async function getDiscount() {
+            const face = document.getElementById('d-face').value;
+            const price = document.getElementById('d-price').value;
+            const days = document.getElementById('d-days').value;
+            const [dRes, bRes] = await Promise.all([
+                fetch(`/api/discount-yield?face_value=${face}&purchase_price=${price}&days=${days}`),
+                fetch(`/api/bond-equivalent-yield?face_value=${face}&purchase_price=${price}&days=${days}`),
+            ]);
+            const [dData, bData] = await Promise.all([dRes.json(), bRes.json()]);
+            const el = document.getElementById('discount-results');
+            el.classList.add('visible');
+            if (dData.error) { el.innerHTML = '<span class="value">' + dData.error + '</span>'; return; }
+            el.innerHTML = `<span class="label">Discount:</span>              <span class="value">$${dData.discount}</span>\n`
+                + `<span class="label">Discount Yield:</span>        <span class="value">${dData.discount_yield_pct}%</span>\n`
+                + `<span class="label">Bond Equivalent Yield:</span> <span class="value">${bData.bey_pct}%</span>`;
+        }
+
+        async function getBondYield() {
+            const coupon = document.getElementById('b-coupon').value;
+            const price = document.getElementById('b-price').value;
+            const res = await fetch(`/api/current-yield?coupon=${coupon}&price=${price}`);
+            const data = await res.json();
+            const el = document.getElementById('bond-results');
+            el.classList.add('visible');
+            if (data.error) { el.innerHTML = '<span class="value">' + data.error + '</span>'; return; }
+            el.innerHTML = `<span class="label">Current Yield:</span> <span class="value">${data.current_yield_pct}%</span>`;
+        }
+    </script>
+</body>
+</html>
