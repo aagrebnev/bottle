@@ -41,11 +41,11 @@ LICHESS_CURRENT_GAME = LICHESS_BASE + "/api/user/{username}/current-game"
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO_URL = "https://api.telegram.org/bot{token}/sendPhoto"
 
-STOCKFISH_DEPTH = 8
-STOCKFISH_MULTIPV = 2
+STOCKFISH_TIME = 0.5  # seconds for Stockfish analysis (time-limited, not depth)
+STOCKFISH_MULTIPV = 1
 
 POLL_INTERVAL = 10  # seconds between checks when no game is active
-GAME_POLL_INTERVAL = 2  # seconds between move checks during a game
+GAME_POLL_INTERVAL = 1  # seconds between move checks during a game (idle only)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -290,7 +290,7 @@ def analyze_position(engine_mgr, board):
 
     Each line is a dict: {"move_san": str, "score": str, "pv_san": [str]}
     """
-    limit = chess.engine.Limit(depth=STOCKFISH_DEPTH)
+    limit = chess.engine.Limit(time=STOCKFISH_TIME)
 
     # Top 3 lines for the side to move
     results = engine_mgr.analyse(board, limit, multipv=STOCKFISH_MULTIPV)
@@ -499,7 +499,7 @@ def format_move_update(
         lines.append("")
         lines.append(f"<b>Best moves for {username} ({player_color_word}):</b>")
         if player_lines:
-            for i, line_info in enumerate(player_lines[:2], 1):
+            for i, line_info in enumerate(player_lines[:1], 1):
                 english = san_to_english(line_info["move_san"])
                 lines.append(
                     f"  {i}. {line_info['move_san']} - {english}"
@@ -646,8 +646,6 @@ def monitor_game(game_id, game_data, username, engine_mgr):
 
     # --- Polling loop ---
     while True:
-        time.sleep(GAME_POLL_INTERVAL)
-
         fresh = get_current_game(username)
         if fresh is None:
             send_telegram_message(format_game_end_message(game_data))
@@ -675,7 +673,12 @@ def monitor_game(game_id, game_data, username, engine_mgr):
                     "Game %s ended with status: %s", game_id, status,
                 )
                 return
+            # Idle — sleep before next poll
+            time.sleep(GAME_POLL_INTERVAL)
             continue
+
+        # New move(s) found — process below, then loop back immediately
+        # (no sleep — the analysis time IS the delay)
 
         # --- Process new moves ---
         # Replay ALL new moves on the board first (fast, no analysis)
